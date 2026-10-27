@@ -1,0 +1,104 @@
+# Uptime check of two public sites, every 10 minutes.
+# A site is down only when two checks 5 minutes apart both fail (login page 200, /readyz/ 200,
+# HTTPS certificate valid for 7 more days). Then: one issue «Sito non raggiungibile» in this repository and one
+# urgent ntfy notification (topic = Actions secret NTFY_TOPIC). Back up: the issue is closed with «risolto» and one
+# normal ntfy notification. At most one notification per hour: a site that goes down again within an hour of
+# coming back reopens the same issue silently.
+# Manual proof: Run workflow with «prova» = a host -> issue «PROVA — Sito non raggiungibile», ntfy «PROVA», closed at once.
+name: uptime
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      prova:
+        description: "PROVA: host to treat as down (nothing real is checked)"
+        required: false
+        default: ""
+permissions:
+  contents: read
+  issues: write
+  actions: write
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      PROVA: ${{ inputs.prova }}
+      HOSTS: "elx.digital test.elx.digital"
+      TITLE: "Sito non raggiungibile"
+    steps:
+      - name: Check
+        shell: bash
+        run: |
+          set -uo pipefail
+          now="$(date -u '+%d/%m/%Y %H:%M UTC')"
+          notify() {  # $1 priority (5 = urgent, rings on silent), $2 title, $3 text; never prints the topic
+            [[ -n "${NTFY_TOPIC:-}" ]] || { echo "ntfy off"; return 0; }
+            payload="$(jq -n --arg t "$NTFY_TOPIC" --arg ti "$2" --arg m "$3" --argjson p "$1" \
+              '{topic:$t,title:$ti,message:$m,priority:$p}')"
+            curl -fsS -o /dev/null --max-time 30 -H 'Content-Type: application/json' -d "$payload" https://ntfy.sh/ \
+              && echo "ntfy sent" || echo "::warning::ntfy not sent"
+          }
+          check_host() {
+            local h="$1" c out=""
+            c="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "https://$h/login/" 2>/dev/null)" || c=000
+            [[ "$c" == 200 ]] || out+="$h: login $c; "
+            c="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "https://$h/readyz/" 2>/dev/null)" || c=000
+            [[ "$c" == 200 ]] || out+="$h: readyz $c; "
+            echo | timeout 20 openssl s_client -servername "$h" -connect "$h:443" -verify_return_error 2>/dev/null \
+              | openssl x509 -noout -checkend 604800 >/dev/null 2>&1 || out+="$h: HTTPS non valido o in scadenza; "
+            [[ -n "$out" ]] && echo "${out%; }"
+            return 0
+          }
+          check_all() { local h f all=""; for h in $HOSTS; do f="$(check_host "$h")"; [[ -n "$f" ]] && all+="$f"$'\n'; done; printf '%s' "$all"; }
+
+          if [[ -n "$PROVA" ]]; then
+            url="$(gh issue create --title "PROVA — $TITLE" --body "PROVA ($now): $PROVA trattato come giù. Nessun guasto reale.")"
+            notify 3 "PROVA — ELX Portal GIÙ" "Solo una prova del controllo esterno ($PROVA): nessun guasto reale."
+            gh issue close "$url" --comment "Prova conclusa: nessun guasto reale."
+            echo "PROVA opened and closed: $url"; exit 0
+          fi
+
+          # Once a day keep the schedule alive (GitHub pauses schedules after 60 days without commits).
+          if [[ "$(date -u +%H%M)" < "0010" ]]; then
+            gh api -X PUT "repos/$GH_REPO/actions/workflows/uptime.yml/enable" >/dev/null && echo "schedule kept alive"
+          fi
+
+          failures="$(check_all)"
+          if [[ -n "$failures" ]]; then
+            echo "first check failed, again in 5 minutes"; printf '%s\n' "$failures"
+            sleep 300; failures="$(check_all)"
+          fi
+          open="$(gh issue list --state open --search "\"$TITLE\" in:title" --json number,title \
+            --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)"
+          if [[ -n "$failures" ]]; then
+            printf 'DOWN\n%s\n' "$failures"
+            body="Ultimo controllo: $now"$'\n'"$(printf '%s' "$failures" | sed 's/^/- /')"$'\n\n'"Le sale continuano a lavorare. Nessuna azione per te: viene sistemato."
+            if [[ -n "$open" ]]; then
+              gh issue edit "$open" --body "$body"   # still down: silent update
+              exit 0
+            fi
+            recent="$(gh issue list --state closed --search "\"$TITLE\" in:title" --json number,title,closedAt \
+              --jq "[.[] | select(.title == \"$TITLE\") | select((now - (.closedAt | fromdateiso8601)) < 3600)][0].number // empty")"
+            if [[ -n "$recent" ]]; then  # down again within the hour: no second notification
+              gh issue reopen "$recent"
+              gh issue edit "$recent" --body "$body"$'\n\n'"(riaperta entro un'ora: nessuna nuova notifica)"
+              exit 0
+            fi
+            gh issue create --title "$TITLE" --body "$body"
+            notify 5 "ELX Portal GIÙ" "$(printf '%s' "$failures" | head -1). Le sale continuano a lavorare. Nessuna azione per te: viene sistemato."
+          else
+            echo "OK: $HOSTS"
+            if [[ -n "$open" ]]; then
+              silent="$(gh issue view "$open" --json body --jq '.body | contains("nessuna nuova notifica")')"
+              gh issue close "$open" --comment "Risolto: risponde di nuovo ($now)."
+              [[ "$silent" == "true" ]] || notify 3 "ELX Portal RISOLTO" "Risponde di nuovo ($now)"
+            fi
+          fi
